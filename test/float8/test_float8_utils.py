@@ -8,7 +8,7 @@ import unittest
 import pytest
 import torch
 
-from torchao.float8.float8_utils import _round_scale_down_to_power_of_2
+from torchao.float8.float8_utils import _round_scale_down_to_power_of_2, IS_ROCM
 from torchao.testing.utils import skip_if_rocm
 
 
@@ -23,7 +23,9 @@ from torchao.testing.utils import skip_if_rocm
         ("inf", float("inf"), float("inf")),
         ("nan", float("nan"), float("nan")),
         ("smallest positive subnormal number", 2**-126 * 2**-23, 2**-126 * 2**-23),
-        ("largest normal number", 2**127 * (2 - 2**-23), float("inf")),
+        # Note: On ROCm, torch.log2 has higher precision than NVIDIA, so the largest
+        # normal number floors to 2^127 instead of overflowing to inf
+        ("largest normal number", 2**127 * (2 - 2**-23), 2**127 if IS_ROCM else float("inf")),
         ("smallest positive normal number", 2**-126, 2**-126),
         ("largest number less than one", 1.0 - 2**-24, 0.5),
         ("smallest number larger than one", 1.0 + 2**-23, 1.0),
@@ -32,7 +34,6 @@ from torchao.testing.utils import skip_if_rocm
         # ("largest subnormal number", [2**-126 * (1 - 2**-23), 1.1754943508222875e-38]),
     ],
 )
-@skip_if_rocm("ROCm enablement in progress")
 def test_round_scale_down_to_power_of_2_valid_inputs(
     test_case: dict,
 ):
