@@ -10,6 +10,7 @@ from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.utils import (
     ceil_div,
     is_cuda_version_at_least,
+    is_ROCM,
     is_sm_at_least_100,
 )
 
@@ -801,12 +802,19 @@ if mxfp8_cuda_extension_available:
         assert chunk_width in (64, 128), "chunk_width must be 64 or 128"
         assert chunks_per_tb in (1, 4, 8, 16), "chunks_per_tb must be 4, 8, or 16"
 
-        return torch.ops.torchao.mx_block_rearrange_2d_M_groups.default(
-            scales_tensor,
-            input_group_end_offsets,
-            chunk_width,
-            chunks_per_tb,
-        )
+        # Use Triton kernel for ROCm, CUDA kernel for NVIDIA
+        if is_ROCM():
+            return triton_mx_block_rearrange_2d_M_groups(
+                scales_tensor,
+                input_group_end_offsets,
+            )
+        else:
+            return torch.ops.torchao.mx_block_rearrange_2d_M_groups.default(
+                scales_tensor,
+                input_group_end_offsets,
+                chunk_width,
+                chunks_per_tb,
+            )
 
     @torch.library.register_fake("torchao::mx_block_rearrange_2d_M_groups")
     def _fake_mx_block_rearrange_2d_M_groups_cuda(
