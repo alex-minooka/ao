@@ -190,8 +190,12 @@ def _int8_dynamic_activation_int4_weight_transform(
 class Int4DynamicActivationInt4WeightConfig(AOBaseConfig):
     """Applies int4 dynamic per token symmetric activation quantization and int4 per row weight symmetric quantization to linear
 
+    On NVIDIA GPUs with CUTLASS support, this uses int4 x int4 quantization with CutlassInt4PackedLayout.
+    On ROCm or when CUTLASS is unavailable, this automatically falls back to PlainLayout with int8 x int4 quantization
+    (int8 activations, int4 weights) for compatibility.
+
     Args:
-        `layout`: layout type for quantized weight tensor, only supports `CutlassInt4PackedLayout()` for now
+        `layout`: layout type for quantized weight tensor, supports `CutlassInt4PackedLayout()` (NVIDIA) and `PlainLayout()` (fallback/ROCm)
         `mapping_type`: quantization type for weight, controls the weight quantization is symmetric or asymmetric
         `act_mapping_type`: quantization type for activation, controls the activation quantization is symmetric or asymmetric
         `set_inductor_config`: if True, adjusts `torchinductor` settings to recommended values.
@@ -209,6 +213,14 @@ class Int4DynamicActivationInt4WeightConfig(AOBaseConfig):
         warnings.warn(
             "`Int4DynamicActivationInt4WeightConfig` will be deleted in a future release of torchao. Please see https://github.com/pytorch/ao/issues/2752 for more details."
         )
+        # On ROCm, CUTLASS is not available, so fall back to PlainLayout
+        if torch.version.hip is not None and isinstance(self.layout, CutlassInt4PackedLayout):
+            warnings.warn(
+                "CutlassInt4PackedLayout is not supported on ROCm. "
+                "Falling back to PlainLayout with dequantization.",
+                UserWarning
+            )
+            object.__setattr__(self, 'layout', PlainLayout())
 
 
 @register_quantize_module_handler(Int4DynamicActivationInt4WeightConfig)
@@ -222,9 +234,9 @@ def _int4_dynamic_activation_int4_weight_transform(
     if config.set_inductor_config:
         torchao.quantization.utils.recommended_inductor_config_setter()
 
-    if not isinstance(layout, CutlassInt4PackedLayout):
+    if not isinstance(layout, (CutlassInt4PackedLayout, PlainLayout)):
         raise NotImplementedError(
-            f"Only CutlassInt4PackedLayout layout is supported. Received {layout}."
+            f"Only CutlassInt4PackedLayout and PlainLayout are supported. Received {layout}."
         )
     if mapping_type != MappingType.SYMMETRIC:
         raise NotImplementedError("Only mapping_type=SYMMETRIC is supported.")
@@ -232,12 +244,34 @@ def _int4_dynamic_activation_int4_weight_transform(
         raise NotImplementedError("Only act_mapping_type=SYMMETRIC is supported.")
 
     # avoid circular import
-    from torchao.quantization.quant_api import _int4_symm_cutlass_quant
+    from torchao.quantization.quant_api import (
+        _int4_symm_cutlass_quant,
+        _int8_symm_per_token_quant,
+    )
 
-    weight = _int4_symm_cutlass_quant(weight)
+    # Quantize weight based on layout
+    if isinstance(layout, CutlassInt4PackedLayout):
+        # CUTLASS path for NVIDIA GPUs - int4 x int4
+        weight = _int4_symm_cutlass_quant(weight)
+        input_quant_func = _int4_symm_cutlass_quant
+    else:
+        # PlainLayout path for fallback/ROCm - int8 x int4 (no efficient int4 x int4 without CUTLASS)
+        block_size = (1, weight.shape[-1])  # Per-row quantization
+        weight = to_affine_quantized_intx(
+            weight,
+            mapping_type,
+            block_size,
+            target_dtype=torch.int8,
+            quant_min=-8,
+            quant_max=7,
+            _layout=layout,
+        )
+        # Use int8 activation quantization for fallback (int8 x int4)
+        input_quant_func = _int8_symm_per_token_quant
+
     weight = to_linear_activation_quantized(
         weight,
-        _int4_symm_cutlass_quant,
+        input_quant_func,
     )
     module.weight = torch.nn.Parameter(weight, requires_grad=False)
     module.extra_repr = types.MethodType(_linear_extra_repr, module)
