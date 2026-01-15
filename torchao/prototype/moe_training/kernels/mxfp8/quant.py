@@ -6,6 +6,7 @@ import triton.language as tl
 from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
+from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim1
 from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.utils import (
     ceil_div,
@@ -738,9 +739,41 @@ if mxfp8_cuda_extension_available:
             torch.float32,
             torch.bfloat16,
         ), "Input tensor must be float32 or bfloat16"
-        return torch.ops.torchao.mxfp8_quantize_3d.default(
-            x, block_size, "e4m3", scaling_mode
-        )
+
+        # Use Triton kernel for ROCm, CUDA kernel for NVIDIA
+        if is_ROCM():
+            # For ROCm, use the Triton implementation
+            # Input shape: (E, N, K), quantizing along N
+            E, N, K = x.shape
+
+            # Convert to bfloat16 if needed (triton_to_mxfp8_dim1 requires bfloat16)
+            if x.dtype == torch.float32:
+                x = x.to(torch.bfloat16)
+
+            # Transpose to (E, K, N) so N is the last dimension
+            x_transposed = x.transpose(1, 2).contiguous()  # (E, K, N)
+
+            # Reshape to 2D: (E*K, N)
+            x_2d = x_transposed.reshape(E * K, N)
+
+            # Quantize along dim1 (N) using Triton kernel
+            # Convert scaling_mode from "floor" to "rceil" format if needed
+            triton_scaling_mode = "rceil" if scaling_mode == "rceil" else "floor"
+            data_2d, scales_2d = triton_to_mxfp8_dim1(
+                x_2d, inner_block_size=block_size, scaling_mode=triton_scaling_mode
+            )
+
+            # Reshape data back: (E*K, N) -> (E, K, N) -> (E, N, K)
+            data_3d = data_2d.reshape(E, K, N).transpose(1, 2)  # (E, N, K)
+
+            # Reshape scales back: (E*K, N//block_size) -> (E, K, N//block_size) -> (E, N//block_size, K)
+            scales_3d = scales_2d.reshape(E, K, N // block_size).transpose(1, 2)  # (E, N//block_size, K)
+
+            return data_3d, scales_3d
+        else:
+            return torch.ops.torchao.mxfp8_quantize_3d.default(
+                x, block_size, "e4m3", scaling_mode
+            )
 
     @torch.library.register_fake("torchao::mxfp8_quantize_3d")
     def _fake_mxfp8_quantize_3d(
